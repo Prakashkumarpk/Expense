@@ -2,34 +2,56 @@
 
 React + Vite frontend and FastAPI backend for a step-by-step expense tracker.
 
-## Phase 3: Supabase PostgreSQL persistence
+## Phase 4: Authentication and user data security
 
-Phase 3 replaces the Phase 2 in-memory dictionary with a PostgreSQL `expenses` table hosted by Supabase. The existing React UI and API paths remain unchanged. Existing in-memory records are not migrated automatically; they disappeared when the old backend stopped and must be entered again if needed.
+Phase 4 adds Supabase Auth, protected React dashboard access, verified FastAPI JWT authentication, and user-owned expenses. The existing expense paths and payloads remain:
 
-Authentication is intentionally not implemented yet. The schema includes a nullable `user_id` reference to `auth.users` as a transition point for Phase 4. It must become required and be populated from the authenticated user before production multi-user use.
+- `POST /api/expenses`
+- `GET /api/expenses`
+- `GET /api/expenses/{id}`
+- `PUT /api/expenses/{id}`
+- `DELETE /api/expenses/{id}`
 
-## Supabase setup
+The frontend uses the official `@supabase/supabase-js` client. Supabase persists the session in the browser and broadcasts auth changes across tabs. The FastAPI backend does not trust a `user_id` request field: it verifies the bearer token and takes the user UUID from the token subject.
 
-1. Create or open a Supabase project.
-2. Open the SQL Editor and run the complete contents of [database/schema.sql](database/schema.sql).
-3. In Supabase, open **Connect** and copy a PostgreSQL connection URI. For a typical local IPv4 network, choose the **Session pooler** connection. It works with normal short-lived `psycopg` connections and is usually reachable when the direct database host requires IPv6.
-4. A direct connection is simplest for a long-running server when your network supports Supabase's direct host (often IPv6). A transaction pooler is designed mainly for serverless/short-lived transactions and is not needed for this beginner-friendly local setup.
-5. Copy `backend/.env.example` to `backend/.env` and replace the placeholder password and host details. Never commit `.env` or paste credentials into chat.
+## Complete the Supabase database setup
+
+The existing Phase 3 schema has a nullable `user_id` because old rows may have been created before authentication. Run the complete [database/schema.sql](database/schema.sql) in the Supabase SQL Editor. It is additive: it creates the table if needed, adds the ownership column if needed, creates indexes, enables RLS, and creates owner policies. It does not delete data or assign ownerless records.
+
+To inspect existing ownerless rows in SQL Editor:
+
+```sql
+select id, amount, date, created_at from public.expenses where user_id is null;
+```
+
+Do not assign those rows to an arbitrary user. Options are: archive/delete them only after confirmation, or manually map each row to the correct Supabase Auth user. After every row has a verified owner, run [database/phase4_require_ownership.sql](database/phase4_require_ownership.sql) to enforce `user_id not null`. That migration deliberately stops with an error if ownerless rows remain.
+
+Enable email/password authentication in Supabase Dashboard ? Authentication ? Providers ? Email. Decide whether **Confirm email** is enabled. When enabled, registration creates the account but returns no active session until the user clicks the confirmation link; the app displays that instruction. When disabled for local learning, registration can sign in immediately.
+
+## Environment configuration
+
+Backend-only `backend/.env`:
 
 ```powershell
+cd D:\Projects\Expense
 Copy-Item backend\.env.example backend\.env
 notepad backend\.env
 ```
 
-The application reads `DATABASE_URL` with `python-dotenv`. It never prints the connection string. If the variable is missing or PostgreSQL is unavailable, API requests return HTTP `503`; the server does not silently fall back to memory.
+Set `DATABASE_URL`, `SUPABASE_URL`, and `SUPABASE_JWT_AUDIENCE=authenticated`. The backend derives the issuer and JWKS URL from `SUPABASE_URL`; optional overrides are documented in the example. Never expose `DATABASE_URL`, database passwords, signing secrets, or service-role keys to the browser.
 
-## Database design
+Frontend-only `frontend/.env`:
 
-`database/schema.sql` creates one table with an identity-generated integer ID, positive `numeric(12,2)` amount, required category/date, optional note, automatic timezone-aware `created_at`, and nullable `user_id`. A category check constraint protects the same supported category list used by the API. Indexes support date ordering and future user ownership queries.
+```powershell
+Copy-Item frontend\.env.example frontend\.env
+notepad frontend\.env
+```
 
-## Run the backend on port 8001
+Set `VITE_SUPABASE_URL`, `VITE_SUPABASE_PUBLISHABLE_KEY` (or the public anon key), and `VITE_API_URL=http://127.0.0.1:8001/api`. A publishable/anon key is intended for browser use but is not a substitute for backend authorization. `.env` files are ignored by Git; the example files contain placeholders only.
 
-From the project root, open PowerShell:
+## Run the applications on the existing ports
+
+Backend, port 8001:
 
 ```powershell
 cd D:\Projects\Expense\backend
@@ -38,22 +60,7 @@ py -m pip install -r requirements.txt
 uvicorn main:app --reload --port 8001
 ```
 
-If the virtual environment does not exist yet:
-
-```powershell
-cd D:\Projects\Expense\backend
-py -m venv venv
-.\venv\Scripts\Activate.ps1
-py -m pip install -r requirements.txt
-uvicorn main:app --reload --port 8001
-```
-
-Health check: `http://127.0.0.1:8001/api/health`
-Interactive API docs: `http://127.0.0.1:8001/docs`
-
-## Run the frontend
-
-In a second PowerShell window:
+Frontend:
 
 ```powershell
 cd D:\Projects\Expense\frontend
@@ -61,31 +68,34 @@ npm install
 npm run dev
 ```
 
-Open `http://localhost:5173`. The existing frontend already calls `http://127.0.0.1:8001/api/expenses`.
+Open `http://localhost:5173`. API docs are at `http://127.0.0.1:8001/docs`.
 
-## Request flow
+## Authentication and data flow
 
-`React form -> fetch() -> FastAPI route -> Pydantic validation -> parameterized SQL -> PostgreSQL -> FastAPI response -> React refresh`.
+1. React calls Supabase `signUp` or `signInWithPassword`.
+2. Supabase returns a session containing an access token. The client persists it and listens for cross-tab `onAuthStateChange` events.
+3. The protected dashboard calls FastAPI with `Authorization: Bearer <access-token>`.
+4. FastAPI's `get_current_user_id` obtains the signing key from Supabase's JWKS endpoint and verifies the JWT signature, issuer, audience, expiry, and UUID subject. It returns `401` for missing/invalid/expired tokens and logs no token contents.
+5. Each SQL query includes `user_id = %s`. POST writes the verified subject; the request body cannot choose an owner. GET, PUT, and DELETE can only see or change that user's rows, returning `404` for another user's ID.
+6. The response returns to React and the dashboard reloads the user's list.
 
-POST uses `INSERT ... RETURNING` so PostgreSQL supplies the ID and `created_at`. GET uses `SELECT`, ordered newest first. PUT uses `UPDATE ... RETURNING` and preserves the original creation timestamp. DELETE uses `DELETE ... RETURNING` to distinguish a successful deletion from a missing ID. Every SQL value is passed separately as a parameter (`%s`), preventing user input from being treated as SQL.
+The RLS policies use `auth.uid()` for Supabase client access. The FastAPI backend uses a direct PostgreSQL/pooler connection and its database role does not automatically receive Supabase's `auth.uid()` request context; a privileged database role may bypass RLS. Therefore RLS alone is not claimed as protection for backend requests. The verified JWT dependency and explicit owner filters are the backend protection. Never place a service-role key in frontend code.
 
-Each request opens a short-lived connection with `psycopg`, uses context managers to close cursors/connections, and commits successful writes. Technical database errors are logged on the backend without exposing credentials to the browser.
+## Testing
 
-## Testing plan
+Use two test accounts with passwords of at least six characters. Do not paste credentials into chat.
 
-Use a harmless test record such as amount `12.34`, category `Food`, date `2026-10-22`, and note `Phase 3 test`; delete it when finished.
+1. Register and sign in as User A.
+2. Create an expense, refresh, and confirm it remains.
+3. Open a second tab and confirm it sees the same session/dashboard.
+4. Sign out in one tab and confirm the second tab becomes signed out. Copying/opening a dashboard URL after logout should show login.
+5. Sign in as User B and create a separate expense.
+6. Try User B's expense ID while authenticated as User A. GET, PUT, and DELETE should return `404`.
+7. Call an expense endpoint without `Authorization`; it should return `401`.
+8. Try amount `0` or a negative amount; validation should return `422`.
+9. Restart FastAPI, sign in again, and verify saved expenses remain in PostgreSQL.
+10. Inspect the backend logs to confirm authentication failures are recorded without passwords or tokens.
 
-1. Set `DATABASE_URL`, run `database/schema.sql`, and start FastAPI on port 8001.
-2. Open `/docs` and call GET `/api/expenses`. A successful response verifies the connection and returns an array.
-3. POST a test expense and save its returned integer ID.
-4. GET the collection and GET `/api/expenses/{id}`.
-5. PUT the same ID with a changed amount or note.
-6. Try amount `0` and a negative amount; both should return `422` before a database write.
-7. Try GET, PUT, and DELETE with an ID that does not exist; each should return `404`.
-8. DELETE the test expense.
-9. Restart FastAPI and call GET again. A previously saved record should still exist because it is stored in Supabase, not process memory.
-10. Repeat create/edit/delete from the React UI and confirm the table refreshes after each successful operation.
+Credential-free checks completed locally: backend syntax check passed, frontend production build passed, public health endpoint returned `200`, missing bearer authentication returned `401`, and invalid amount validation returned `422`. Supabase registration, cross-tab behavior, and two-user isolation are not claimed as tested until real Supabase configuration and test accounts are supplied locally.
 
-The backend syntax check and frontend build can run without credentials. Full CRUD/database verification requires your real Supabase `DATABASE_URL`, so it must not be claimed until that manual setup is complete.
-
-Phase 1's `/api/health` endpoint and Phase 2's API paths, validation, response fields, and frontend behavior are preserved. Authentication, AI, file uploads, and Phase 4 are intentionally not included.
+Phase 5 has not been started.
